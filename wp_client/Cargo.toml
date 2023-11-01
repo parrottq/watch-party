@@ -1,0 +1,10 @@
+[package]
+name = "wp_client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1.0.75", features = ["backtrace"] }
+gstreamer = "0.21.1"
+gstreamer-play = "0.21.0"
+webrtc = "0.9.0"

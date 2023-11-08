@@ -1,13 +1,15 @@
+use std::fs::{create_dir, File};
+use std::io::{stdout, Read, Write};
+use std::path::PathBuf;
 use std::time::Instant;
 use std::{env, sync::Arc, time::Duration};
 
 use anyhow::Result;
-
-use gstreamer::ClockTime;
-use gstreamer_play::{Play, PlayMessage, PlayVideoRenderer};
+use futures_util::StreamExt;
+use gstreamer_play::{Play, PlayVideoRenderer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use wp_transaction::{ClientMsg, ServerMsg, MAGIC, VERSION};
+use wp_transaction::{ClientMsg, ContentHash, ServerMsg, MAGIC, VERSION};
 
 async fn send_socket(socket: &mut TcpStream, payload: impl AsRef<ClientMsg>) -> Result<()> {
     let buf: Vec<u8> = postcard::to_allocvec(payload.as_ref())?;
@@ -19,58 +21,16 @@ async fn send_socket(socket: &mut TcpStream, payload: impl AsRef<ClientMsg>) -> 
     Ok(())
 }
 
-fn main_loop(uri: &str) -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     gstreamer::init()?;
 
     let play = Play::new(None::<PlayVideoRenderer>);
-    play.set_uri(Some(uri));
-    play.play();
-    play.seek(ClockTime::from_seconds_f64(1.0));
-    dbg!(play.pipeline());
+    let dir = PathBuf::from("video/");
+    let _ = create_dir(&dir);
+    let dir = dir.canonicalize()?;
+    println!("Directory: {:?}", dir);
 
-    let mut result = Ok(());
-    for msg in play.message_bus().iter_timed(gstreamer::ClockTime::NONE) {
-        // dbg!(&msg);
-        match PlayMessage::parse(&msg) {
-            Ok(PlayMessage::EndOfStream) => {
-                play.stop();
-                break;
-            }
-            Ok(PlayMessage::Error { error, details: _ }) => {
-                result = Err(error);
-                play.stop();
-                break;
-            }
-            Ok(msg) => match &msg {
-                PlayMessage::PositionUpdated { position } => {
-                    if position.map_or(false, |x| x.seconds_f64() > 3.0) {
-                        play.pause();
-                    }
-                }
-                PlayMessage::UriLoaded => (),
-                PlayMessage::DurationChanged { duration } => (),
-                PlayMessage::StateChanged { state } => (),
-                PlayMessage::Buffering { percent } => (),
-                PlayMessage::EndOfStream => (),
-                PlayMessage::Error { error, details } => todo!(),
-                PlayMessage::Warning { error, details } => todo!(),
-                PlayMessage::VideoDimensionsChanged { width, height } => todo!(),
-                PlayMessage::MediaInfoUpdated { info } => (),
-                PlayMessage::VolumeChanged { volume } => (),
-                PlayMessage::MuteChanged { muted } => todo!(),
-                PlayMessage::SeekDone => todo!(),
-                e => {
-                    dbg!(e);
-                }
-            },
-            Err(_) => unreachable!(),
-        }
-    }
-    result.map_err(|e| e.into())
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
     let start_time = Instant::now();
     let mut socket = TcpStream::connect("127.0.0.1:3945").await?;
     socket.write(MAGIC).await?;
@@ -98,20 +58,86 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
+            ServerMsg::LoadVideo {
+                hash,
+                name,
+                download,
+            } => {
+                let mut file_path = dir.clone();
+                file_path.push(name);
+                println!("Loading file: {:?}", file_path);
+                if file_path.exists() {
+                    let ContentHash::Sha256(hash) = hash;
+                    let mut file = File::open(&file_path)?;
+                    let mut buf = Vec::new();
+                    buf.resize(ring::digest::SHA256_OUTPUT_LEN * 1024, 0);
+                    let mut hash_context = ring::digest::Context::new(&ring::digest::SHA256);
+                    loop {
+                        let len = file.read(&mut buf)?;
+                        if len == 0 {
+                            break;
+                        }
+                        hash_context.update(&buf[..len]);
+                    }
+
+                    let hash_digest = hash_context.finish();
+                    let hash_digest = hash_digest.as_ref();
+                    let mut hash_digest_str = String::with_capacity(64);
+                    hash_digest.into_iter().for_each(|x| {
+                        use std::fmt::Write;
+                        write!(&mut hash_digest_str, "{x:02x}").unwrap();
+                    });
+                    if hash_digest_str == hash {
+                        let e = file_path.as_os_str().to_os_string();
+                        const START: &str = r#"\\?\"#;
+                        let e = e.to_string_lossy();
+                        assert!(e.starts_with(START), "{e:?}");
+                        let e = e.replacen(START, "file:///", 1);
+                        play.set_uri(Some(&e));
+                        play.play();
+                        continue;
+                    }
+                    println!("Wrong video file download");
+                }
+
+                match download {
+                    wp_transaction::Download::Https(file_url) => {
+                        let response = reqwest::get(file_url).await?;
+                        let content_length = response.content_length();
+                        println!("Len {:?}", content_length);
+
+                        let mut video_file_stream = response.bytes_stream();
+
+                        let mut file = std::fs::File::create(file_path)?;
+                        let mut hash_context = ring::digest::Context::new(&ring::digest::SHA256);
+                        let mut content_progress: u64 = 0;
+                        let mut last_pogress = u64::MAX;
+                        while let Some(chunk) = video_file_stream.next().await {
+                            let chunk = chunk?;
+                            content_progress += {
+                                let chunk_size = chunk.len();
+                                TryInto::<u64>::try_into(chunk_size).unwrap()
+                            };
+                            if let Some(content_length) = content_length {
+                                let progress = content_progress * 100 / content_length;
+                                if progress != last_pogress {
+                                    last_pogress = progress;
+                                    print!(
+                                        "  {}%: {}/{}\r",
+                                        progress, content_progress, content_length
+                                    );
+                                    stdout().flush()?;
+                                }
+                            }
+                            file.write(chunk.as_ref()).unwrap();
+                            hash_context.update(chunk.as_ref())
+                        }
+                        println!("Hash: {:?}", hash_context.finish());
+                    }
+                    wp_transaction::Download::None => todo!(),
+                }
+            }
             _ => todo!(),
         }
     }
-    todo!();
-
-    let args: Vec<_> = env::args().collect();
-    let uri: &str = if args.len() == 2 {
-        args[1].as_ref()
-    } else {
-        println!("Usage: play uri");
-        std::process::exit(-1)
-    };
-
-    main_loop(uri)?;
-
-    Ok(())
 }

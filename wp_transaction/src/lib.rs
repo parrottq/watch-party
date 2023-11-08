@@ -49,5 +49,5 @@ pub enum Download {
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub enum ContentHash {
-    Sha256(Vec<u8>),
+    Sha256(String),
 }

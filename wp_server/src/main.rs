@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use tokio::io::{stdin, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
-use wp_transaction::{ClientMsg, ServerMsg, MAGIC, VERSION};
+use tokio::sync::{broadcast, RwLock};
+use wp_transaction::{ClientMsg, ContentHash, Download, ServerMsg, MAGIC, VERSION};
 
 async fn send_socket(socket: &mut TcpStream, payload: impl AsRef<ServerMsg>) -> Result<()> {
     let buf: Vec<u8> = postcard::to_allocvec(payload.as_ref())?;
@@ -18,23 +19,30 @@ async fn send_socket(socket: &mut TcpStream, payload: impl AsRef<ServerMsg>) -> 
     Ok(())
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct VideoDescription {
+    hash: ContentHash,
+    name: String,
+    download: Download,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:3945").await?;
     let start_time = Arc::new(Instant::now());
 
     let (broadcast_tx, broadcast_rx) = broadcast::channel(10);
-    // let (retransmit_queue_tx, mut retransmit_queue_rx) = mpsc::channel(20);
-    // let retransmit_queue_tx = Arc::new(retransmit_queue_tx);
+    let current_video = Arc::new(RwLock::new(None));
 
+    let current_video_clients = current_video.clone();
     tokio::spawn(async move {
         loop {
             let (mut socket, addr) = listener.accept().await.unwrap();
-            // let (mut socket_recv, mut socket_send) = tokio::io::split(socket);
 
             let mut retransmit_channel = broadcast_rx.resubscribe();
 
             let start_time = start_time.clone();
+            let current_video = current_video_clients.clone();
             tokio::spawn(async move {
                 let mut magic_buf = [0; 4];
                 socket.read_exact(&mut magic_buf).await.unwrap();
@@ -109,6 +117,12 @@ async fn main() -> Result<()> {
                 println!("{}: Time delta is {}s", addr, mean_time_delta);
 
                 let mean_time_delta = Duration::from_secs_f64(mean_time_delta);
+
+                {
+                    if let Some(loaded_video) = &*current_video.read().await {
+                        send_socket(&mut socket, loaded_video).await.unwrap();
+                    }
+                }
 
                 loop {
                     let command: ServerMsg = retransmit_channel.recv().await.unwrap();

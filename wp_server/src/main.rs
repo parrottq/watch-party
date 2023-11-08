@@ -1,68 +1,162 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::io::{stdin, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
+use wp_transaction::{ClientMsg, ServerMsg, MAGIC, VERSION};
+
+async fn send_socket(socket: &mut TcpStream, payload: impl AsRef<ServerMsg>) -> Result<()> {
+    let buf: Vec<u8> = postcard::to_allocvec(payload.as_ref())?;
+
+    socket.write_u32_le(buf.len().try_into()?).await?;
+    socket.write(&buf).await?;
+    socket.flush().await?;
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:3945").await?;
+    let start_time = Arc::new(Instant::now());
 
-    let (broadcast_tx, broadcast_rx): (broadcast::Sender<Bytes>, _) = broadcast::channel(10);
-    let (retransmit_queue_tx, mut retransmit_queue_rx) = mpsc::channel(20);
-    let retransmit_queue_tx = Arc::new(retransmit_queue_tx);
+    let (broadcast_tx, broadcast_rx) = broadcast::channel(10);
+    // let (retransmit_queue_tx, mut retransmit_queue_rx) = mpsc::channel(20);
+    // let retransmit_queue_tx = Arc::new(retransmit_queue_tx);
 
     tokio::spawn(async move {
-        // Forward packets from any connection to all other sockets
         loop {
-            let data = retransmit_queue_rx.recv().await.unwrap();
-            broadcast_tx.send(data).unwrap();
+            let (mut socket, addr) = listener.accept().await.unwrap();
+            // let (mut socket_recv, mut socket_send) = tokio::io::split(socket);
+
+            let mut retransmit_channel = broadcast_rx.resubscribe();
+
+            let start_time = start_time.clone();
+            tokio::spawn(async move {
+                let mut magic_buf = [0; 4];
+                socket.read_exact(&mut magic_buf).await.unwrap();
+
+                if *MAGIC != magic_buf {
+                    send_socket(&mut socket, ServerMsg::Error(format!("Bad magic number")))
+                        .await
+                        .unwrap();
+                    panic!("Bad magic number {magic_buf:?}");
+                }
+
+                // let mut version_buf = [0; 4];
+                let version = socket.read_u32_le().await.unwrap();
+
+                if version != VERSION {
+                    send_socket(
+                        &mut socket,
+                        ServerMsg::Error(format!("Unsupported version")),
+                    )
+                    .await
+                    .unwrap();
+                    panic!("Wrong version {version} (supported version {VERSION})");
+                }
+
+                println!("{}: Client connected", addr);
+
+                println!("{}: Syncing time...", addr);
+                let mut time_id_counter = 0;
+                let mut samples = vec![];
+                for _ in 0..100 {
+                    send_socket(
+                        &mut socket,
+                        ServerMsg::RequestTime {
+                            id: time_id_counter,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let time = Instant::now();
+
+                    let size = socket.read_u32_le().await.unwrap();
+                    let delta = time.elapsed();
+                    let current_time = start_time.elapsed();
+
+                    let mut buf = vec![0; size.try_into().unwrap()];
+                    socket.read_exact(&mut buf).await.unwrap();
+                    let res: ClientMsg = postcard::from_bytes(&mut buf).unwrap();
+                    let ClientMsg::CurrentTime {
+                        id: _,
+                        unix_time_micro,
+                    } = res;
+
+                    let client_time = Duration::from_micros(unix_time_micro.try_into().unwrap());
+                    let estimated_client_delta = current_time - (client_time + delta / 2);
+                    // dbg!(delta, current_time, client_time, &res, estimated_client_delta);
+                    samples.push((delta, estimated_client_delta));
+
+                    time_id_counter += 1;
+                }
+
+                let samples = samples.into_iter().collect::<BTreeMap<_, _>>();
+                dbg!(&samples);
+                let mut samples_iter = samples.into_iter().rev();
+                let (mut _last_error, mean) = samples_iter.next().unwrap();
+                let mut mean_time_delta = mean.as_secs_f64();
+                for (_error, sample) in samples_iter {
+                    // TODO: Measure this based on error somehow to be more statistically rigorous?
+                    let sample_importance_ration = 0.25;
+                    mean_time_delta = mean_time_delta * (sample_importance_ration)
+                        + sample.as_secs_f64() * (1.0 - sample_importance_ration);
+                }
+                println!("{}: Time delta is {}s", addr, mean_time_delta);
+
+                let mean_time_delta = Duration::from_secs_f64(mean_time_delta);
+
+                loop {
+                    let command: ServerMsg = retransmit_channel.recv().await.unwrap();
+                    let msg = match command {
+                        ServerMsg::StartPlayingAt {
+                            unix_time_micro,
+                            play_back_time,
+                        } => {
+                            let client_time_micro =
+                                (Duration::from_micros(unix_time_micro.try_into().unwrap())
+                                    - mean_time_delta)
+                                    .as_micros();
+                            ServerMsg::StartPlayingAt {
+                                unix_time_micro: client_time_micro,
+                                play_back_time,
+                            }
+                        }
+                        msg => msg,
+                    };
+                    send_socket(&mut socket, msg).await.unwrap();
+                }
+            });
         }
     });
 
     loop {
-        let (socket, _addr) = listener.accept().await?;
-        let (mut socket_recv, mut socket_send) = tokio::io::split(socket);
-
-        let mut retransmit_channel = broadcast_rx.resubscribe();
-
-        tokio::spawn(async move {
-            loop {
-                // Take broadcasted packets and send back to client
-                let res = retransmit_channel.recv().await;
-                socket_send.write(res.unwrap().as_ref()).await.unwrap();
-                socket_send.flush().await.unwrap();
+        let mut msg = Vec::new();
+        loop {
+            let byte = stdin().read_u8().await.unwrap();
+            if byte == b'\n' {
+                break;
             }
-        });
+            msg.push(byte);
+        }
 
-        let retransmit_queue_tx = retransmit_queue_tx.clone();
-        tokio::spawn(async move {
-            // Receive packets from client and send to the rebroadcaster task
-            let mut buf = [0; 1024];
+        let msg = String::from_utf8_lossy(&msg);
+        let msg = msg.trim();
+        println!("Msg '{}'", msg);
 
-            loop {
-                let mut size: usize = socket_recv.read_u16().await.unwrap().into();
-                if size > buf.len() {
-                    // Ignore if the packet is too big
-                    while size > 0 {
-                        let n = size.min(buf.len());
-                        socket_recv.read_exact(&mut buf[..n]).await.unwrap();
-                        size = size.saturating_sub(n);
-                    }
-                } else {
-                    let buf = &mut buf[..size];
-                    socket_recv.read_exact(buf).await.unwrap();
-
-                    let mut owned_buf = Vec::with_capacity(2 + buf.len());
-                    owned_buf.extend(u16::to_be_bytes(size as u16));
-                    owned_buf.extend_from_slice(buf);
-
-                    retransmit_queue_tx.send(Bytes::from(owned_buf)).await.unwrap();
-                }
+        match msg {
+            "exit" => {
+                break;
             }
-        });
+            "t" => {
+                broadcast_tx.send(ServerMsg::Error(format!("wow")))?;
+            }
+            _ => (),
+        }
     }
 
     Ok(())

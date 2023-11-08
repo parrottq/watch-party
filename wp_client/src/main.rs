@@ -1,62 +1,25 @@
-use std::env;
+use std::time::Instant;
+use std::{env, sync::Arc, time::Duration};
 
-use anyhow::Error;
-
-mod examples_common {
-    #[cfg(not(target_os = "macos"))]
-    pub fn run<T, F: FnOnce() -> T + Send + 'static>(main: F) -> T
-    where
-        T: Send + 'static,
-    {
-        main()
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn run<T, F: FnOnce() -> T + Send + 'static>(main: F) -> T
-    where
-        T: Send + 'static,
-    {
-        use std::thread;
-
-        use cocoa::appkit::NSApplication;
-
-        unsafe {
-            let app = cocoa::appkit::NSApp();
-            let t = thread::spawn(|| {
-                let res = main();
-
-                let app = cocoa::appkit::NSApp();
-                app.stop_(cocoa::base::nil);
-
-                // Stopping the event loop requires an actual event
-                let event = cocoa::appkit::NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
-                cocoa::base::nil,
-                cocoa::appkit::NSEventType::NSApplicationDefined,
-                cocoa::foundation::NSPoint { x: 0.0, y: 0.0 },
-                cocoa::appkit::NSEventModifierFlags::empty(),
-                0.0,
-                0,
-                cocoa::base::nil,
-                cocoa::appkit::NSEventSubtype::NSApplicationActivatedEventType,
-                0,
-                0,
-            );
-                app.postEvent_atStart_(event, cocoa::base::YES);
-
-                res
-            });
-
-            app.run();
-
-            t.join().unwrap()
-        }
-    }
-}
+use anyhow::Result;
 
 use gstreamer::ClockTime;
 use gstreamer_play::{Play, PlayMessage, PlayVideoRenderer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use wp_transaction::{ClientMsg, ServerMsg, MAGIC, VERSION};
 
-fn main_loop(uri: &str) -> Result<(), Error> {
+async fn send_socket(socket: &mut TcpStream, payload: impl AsRef<ClientMsg>) -> Result<()> {
+    let buf: Vec<u8> = postcard::to_allocvec(payload.as_ref())?;
+
+    socket.write_u32_le(buf.len().try_into()?).await?;
+    socket.write(&buf).await?;
+    socket.flush().await?;
+
+    Ok(())
+}
+
+fn main_loop(uri: &str) -> Result<()> {
     gstreamer::init()?;
 
     let play = Play::new(None::<PlayVideoRenderer>);
@@ -106,7 +69,40 @@ fn main_loop(uri: &str) -> Result<(), Error> {
     result.map_err(|e| e.into())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<()> {
+    let start_time = Instant::now();
+    let mut socket = TcpStream::connect("127.0.0.1:3945").await?;
+    socket.write(MAGIC).await?;
+    socket.write_u32_le(VERSION).await?;
+    socket.flush().await?;
+    let mut buf = Vec::new();
+    loop {
+        let size = socket.read_u32_le().await?.try_into()?;
+        buf.clear();
+        // buf.reserve(size);
+        buf.resize(size, 0);
+        let mut buf_slice = &mut buf[..size];
+        socket.read_exact(&mut buf_slice).await?;
+        let msg: ServerMsg = postcard::from_bytes(&buf_slice)?;
+        dbg!(&msg);
+        match msg {
+            ServerMsg::Error(error) => println!("Got error: {}", error),
+            ServerMsg::RequestTime { id } => {
+                send_socket(
+                    &mut socket,
+                    ClientMsg::CurrentTime {
+                        id,
+                        unix_time_micro: start_time.elapsed().as_micros(),
+                    },
+                )
+                .await?;
+            }
+            _ => todo!(),
+        }
+    }
+    todo!();
+
     let args: Vec<_> = env::args().collect();
     let uri: &str = if args.len() == 2 {
         args[1].as_ref()
@@ -115,8 +111,7 @@ fn main() {
         std::process::exit(-1)
     };
 
-    match main_loop(uri) {
-        Ok(r) => r,
-        Err(e) => eprintln!("Error! {e}"),
-    }
+    main_loop(uri)?;
+
+    Ok(())
 }

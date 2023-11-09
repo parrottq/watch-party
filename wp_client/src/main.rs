@@ -67,7 +67,6 @@ async fn main() -> Result<()> {
                 file_path.push(name);
                 println!("Loading file: {:?}", file_path);
                 if file_path.exists() {
-                    let ContentHash::Sha256(hash) = hash;
                     let mut file = File::open(&file_path)?;
                     let mut buf = Vec::new();
                     buf.resize(ring::digest::SHA256_OUTPUT_LEN * 1024, 0);
@@ -87,7 +86,8 @@ async fn main() -> Result<()> {
                         use std::fmt::Write;
                         write!(&mut hash_digest_str, "{x:02x}").unwrap();
                     });
-                    if hash_digest_str == hash {
+                    let ContentHash::Sha256(hash) = &hash;
+                    if &hash_digest_str == hash {
                         let e = file_path.as_os_str().to_os_string();
                         const START: &str = r#"\\?\"#;
                         let e = e.to_string_lossy();
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
 
                         let mut video_file_stream = response.bytes_stream();
 
-                        let mut file = std::fs::File::create(file_path)?;
+                        let mut file = std::fs::File::create(&file_path)?;
                         let mut hash_context = ring::digest::Context::new(&ring::digest::SHA256);
                         let mut content_progress: u64 = 0;
                         let mut last_pogress = u64::MAX;
@@ -132,7 +132,24 @@ async fn main() -> Result<()> {
                             file.write(chunk.as_ref()).unwrap();
                             hash_context.update(chunk.as_ref())
                         }
-                        println!("Hash: {:?}", hash_context.finish());
+                        let hash_digest = hash_context.finish();
+                        let hash_digest = hash_digest.as_ref();
+                        let mut hash_digest_str = String::with_capacity(64);
+                        hash_digest.into_iter().for_each(|x| {
+                            use std::fmt::Write;
+                            write!(&mut hash_digest_str, "{x:02x}").unwrap();
+                        });
+                        let ContentHash::Sha256(hash) = &hash;
+                        if &hash_digest_str == hash {
+                            let e = file_path.as_os_str().to_os_string();
+                            const START: &str = r#"\\?\"#;
+                            let e = e.to_string_lossy();
+                            assert!(e.starts_with(START), "{e:?}");
+                            let e = e.replacen(START, "file:///", 1);
+                            play.set_uri(Some(&e));
+                            play.play();
+                            continue;
+                        }
                     }
                     wp_transaction::Download::None => todo!(),
                 }

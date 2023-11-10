@@ -196,25 +196,22 @@ async fn client(
     mut retransmit_channel: broadcast::Receiver<ServerMsg>,
 ) -> Result<()> {
     let mut magic_buf = [0; 4];
-    socket.read_exact(&mut magic_buf).await.unwrap();
+    socket.read_exact(&mut magic_buf).await?;
 
     if *MAGIC != magic_buf {
-        send_socket(&mut socket, ServerMsg::Error(format!("Bad magic number")))
-            .await
-            .unwrap();
+        send_socket(&mut socket, ServerMsg::Error(format!("Bad magic number"))).await?;
         panic!("Bad magic number {magic_buf:?}");
     }
 
     // let mut version_buf = [0; 4];
-    let version = socket.read_u32_le().await.unwrap();
+    let version = socket.read_u32_le().await?;
 
     if version != VERSION {
         send_socket(
             &mut socket,
             ServerMsg::Error(format!("Unsupported version")),
         )
-        .await
-        .unwrap();
+        .await?;
         panic!("Wrong version {version} (supported version {VERSION})");
     }
 
@@ -230,23 +227,22 @@ async fn client(
                 id: time_id_counter,
             },
         )
-        .await
-        .unwrap();
+        .await?;
         let time = Instant::now();
 
-        let size = socket.read_u32_le().await.unwrap();
+        let size = socket.read_u32_le().await?;
         let delta = time.elapsed();
         let current_time = start_time.elapsed();
 
-        let mut buf = vec![0; size.try_into().unwrap()];
-        socket.read_exact(&mut buf).await.unwrap();
-        let res: ClientMsg = postcard::from_bytes(&mut buf).unwrap();
+        let mut buf = vec![0; size.try_into()?];
+        socket.read_exact(&mut buf).await?;
+        let res: ClientMsg = postcard::from_bytes(&mut buf)?;
         let ClientMsg::CurrentTime {
             id: _,
             unix_time_micro,
         } = res;
 
-        let client_time = Duration::from_micros(unix_time_micro.try_into().unwrap());
+        let client_time = Duration::from_micros(unix_time_micro.try_into()?);
         let estimated_client_delta = current_time - (client_time + delta / 2);
         // dbg!(delta, current_time, client_time, &res, estimated_client_delta);
         samples.push((delta, estimated_client_delta));
@@ -275,9 +271,7 @@ async fn client(
         sample_count
     );
     info!("{}: {}", addr, greeting);
-    send_socket(&mut socket, ServerMsg::Error(greeting))
-        .await
-        .unwrap();
+    send_socket(&mut socket, ServerMsg::Error(greeting)).await?;
 
     let mean_time_delta = Duration::from_secs_f64(mean_time_delta);
 
@@ -285,9 +279,7 @@ async fn client(
         if let Some((loaded_video, state)) = &*current_video.read().await {
             let mut state = *state;
             state.normalize_time(&start_time);
-            send_socket(&mut socket, Into::<ServerMsg>::into(loaded_video.clone()))
-                .await
-                .unwrap();
+            send_socket(&mut socket, Into::<ServerMsg>::into(loaded_video.clone())).await?;
             send_socket(
                 &mut socket,
                 match Into::<ServerMsg>::into(state) {
@@ -296,8 +288,7 @@ async fn client(
                         playback_time_frames,
                     } => {
                         let client_time_micro =
-                            (Duration::from_micros(unix_time_micro.try_into().unwrap())
-                                - mean_time_delta)
+                            (Duration::from_micros(unix_time_micro.try_into()?) - mean_time_delta)
                                 .as_micros();
                         ServerMsg::StartPlayingAt {
                             unix_time_micro: client_time_micro,
@@ -307,21 +298,20 @@ async fn client(
                     other => other,
                 },
             )
-            .await
-            .unwrap();
+            .await?;
         }
     }
 
     loop {
-        let command: ServerMsg = retransmit_channel.recv().await.unwrap();
+        let command: ServerMsg = retransmit_channel.recv().await?;
         let msg = match command {
             ServerMsg::StartPlayingAt {
                 unix_time_micro,
                 playback_time_frames,
             } => {
-                let client_time_micro =
-                    (Duration::from_micros(unix_time_micro.try_into().unwrap()) - mean_time_delta)
-                        .as_micros();
+                let client_time_micro = (Duration::from_micros(unix_time_micro.try_into()?)
+                    - mean_time_delta)
+                    .as_micros();
                 ServerMsg::StartPlayingAt {
                     unix_time_micro: client_time_micro,
                     playback_time_frames,
@@ -329,7 +319,7 @@ async fn client(
             }
             msg => msg,
         };
-        send_socket(&mut socket, msg).await.unwrap();
+        send_socket(&mut socket, msg).await?;
     }
 }
 
@@ -418,7 +408,7 @@ async fn main() -> Result<()> {
                         if let Some((_loaded_video, state)) = &mut *current_video_guard {
                             state.normalize_time(&start_time);
                             state.offset_playback_frames(seek_speeds[current_seek_speed] * sign);
-                            broadcast_tx.send((*state).into()).unwrap();
+                            broadcast_tx.send((*state).into())?;
                         }
                     }
                     KeyCode::Char(' ') | KeyCode::Char('k') => {

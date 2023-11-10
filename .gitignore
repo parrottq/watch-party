@@ -2,3 +2,8 @@
 
 *.mkv
 *.txt
+
+*.json
+*.dll
+*.exe
+*.zip

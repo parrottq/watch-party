@@ -29,7 +29,11 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    println!("Welcome!");
+
     let config: Config = serde_json::from_reader(File::open("config.json")?)?;
+
+    println!("Loading gstreamer...");
 
     gstreamer::init()?;
     Registry::get().scan_path(".");
@@ -40,11 +44,13 @@ async fn main() -> Result<()> {
     let dir = dir.canonicalize()?;
     println!("Directory: {:?}", dir);
 
+    println!("Connecting to host '{}'", config.host);
     let start_time = Instant::now();
     let mut socket = TcpStream::connect(&config.host).await?;
     socket.write(MAGIC).await?;
     socket.write_u32_le(VERSION).await?;
     socket.flush().await?;
+    println!("Syncing time...");
     let mut buf = Vec::new();
     loop {
         let size = socket.read_u32_le().await?.try_into()?;
@@ -53,7 +59,6 @@ async fn main() -> Result<()> {
         let mut buf_slice = &mut buf[..size];
         socket.read_exact(&mut buf_slice).await?;
         let msg: ServerMsg = postcard::from_bytes(&buf_slice)?;
-        dbg!(&msg);
         match msg {
             ServerMsg::Error(error) => println!("Got error: {}", error),
             ServerMsg::RequestTime { id } => {
@@ -65,6 +70,7 @@ async fn main() -> Result<()> {
                     },
                 )
                 .await?;
+                println!("Sampling time ({})", id);
             }
             ServerMsg::LoadVideo {
                 hash,

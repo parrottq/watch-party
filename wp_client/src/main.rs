@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use gstreamer::ClockTime;
+use gstreamer::{ClockTime, Registry};
 use gstreamer_play::{Play, PlayVideoRenderer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -22,9 +22,17 @@ async fn send_socket(socket: &mut TcpStream, payload: impl AsRef<ClientMsg>) -> 
     Ok(())
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct Config {
+    host: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let config: Config = serde_json::from_reader(File::open("config.json")?)?;
+
     gstreamer::init()?;
+    Registry::get().scan_path(".");
 
     let play = Play::new(None::<PlayVideoRenderer>);
     let dir = PathBuf::from("video/");
@@ -33,7 +41,7 @@ async fn main() -> Result<()> {
     println!("Directory: {:?}", dir);
 
     let start_time = Instant::now();
-    let mut socket = TcpStream::connect("127.0.0.1:3945").await?;
+    let mut socket = TcpStream::connect(&config.host).await?;
     socket.write(MAGIC).await?;
     socket.write_u32_le(VERSION).await?;
     socket.flush().await?;

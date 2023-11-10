@@ -1948,6 +1948,7 @@ dependencies = [
  "postcard",
  "reqwest",
  "ring",
+ "serde",
  "serde_json",
  "tokio",
  "wp_transaction",

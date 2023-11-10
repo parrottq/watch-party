@@ -54,6 +54,39 @@ enum State {
     },
 }
 
+impl State {
+    fn normalize_time(&mut self, start_time: &Instant) {
+        match self {
+            State::StartPlayingAt {
+                unix_time_micro,
+                playback_time_frames,
+            } => {
+                let elapsed = start_time.elapsed();
+                let time_played_since_pause = elapsed.saturating_sub(Duration::from_micros(
+                    (*unix_time_micro).try_into().unwrap(),
+                )) + PLAYBACK_START_BUF;
+                let time_played_since_pause_frames =
+                    (time_played_since_pause.as_secs_f64() * FPS) as u64;
+                *unix_time_micro = elapsed.as_micros();
+                *playback_time_frames += time_played_since_pause_frames;
+            }
+            State::PauseAt { .. } => (),
+        }
+    }
+
+    fn offset_playback_frames(&mut self, offset: i64) {
+        match self {
+            State::PauseAt {
+                playback_time_frames,
+            }
+            | State::StartPlayingAt {
+                playback_time_frames,
+                ..
+            } => *playback_time_frames = playback_time_frames.saturating_add_signed(offset),
+        }
+    }
+}
+
 impl From<State> for ServerMsg {
     fn from(value: State) -> Self {
         match value {
@@ -149,6 +182,10 @@ impl<'a> Widget for LogBufferWidget<'a> {
         }
     }
 }
+
+// TODO: Make milliseconds delay configurable? Or dynamically adapt based on client latencies?
+const PLAYBACK_START_BUF: Duration = Duration::from_millis(500);
+const FPS: f64 = 60.0;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -249,12 +286,14 @@ async fn main() -> Result<()> {
 
                 {
                     if let Some((loaded_video, state)) = &*current_video.read().await {
+                        let mut state = *state;
+                        state.normalize_time(&start_time);
                         send_socket(&mut socket, Into::<ServerMsg>::into(loaded_video.clone()))
                             .await
                             .unwrap();
                         send_socket(
                             &mut socket,
-                            match Into::<ServerMsg>::into(*state) {
+                            match Into::<ServerMsg>::into(state) {
                                 ServerMsg::StartPlayingAt {
                                     unix_time_micro,
                                     playback_time_frames,
@@ -300,10 +339,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // TODO: Make milliseconds delay configurable? Or dynamically adapt based on client latencies?
-    const PLAYBACK_START_BUF: Duration = Duration::from_millis(500);
-    let fps = 60.0;
-
     stdout().execute(EnterAlternateScreen)?;
     enable_raw_mode()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
@@ -312,6 +347,8 @@ async fn main() -> Result<()> {
 
     let mut log_buffer = LogBuffer::new();
     let mut event_stream = EventStream::new();
+    let seek_speeds = [60 * 10, 60 * 1, 30, 5, 1];
+    let mut current_seek_speed = 1;
     loop {
         let event = tokio::select! {
             event = event_stream.next() => {
@@ -329,24 +366,34 @@ async fn main() -> Result<()> {
                         // Exit
                         break;
                     }
-                    KeyCode::Char(' ') => {
+                    KeyCode::Char('u') | KeyCode::Down => {
+                        current_seek_speed = (current_seek_speed + 1).min(seek_speeds.len() - 1);
+                    }
+                    KeyCode::Char('o') | KeyCode::Up => {
+                        current_seek_speed = current_seek_speed.saturating_sub(1);
+                    }
+                    key @ (KeyCode::Char('j') | KeyCode::Char('l') | KeyCode::Right | KeyCode::Left) => {
+                        let sign = if key == KeyCode::Char('l') || key == KeyCode::Right { 1 } else { -1 };
+                        let mut current_video_guard = current_video.write().await;
+                        if let Some((_loaded_video, state)) = &mut *current_video_guard {
+                            state.normalize_time(&start_time);
+                            state.offset_playback_frames(seek_speeds[current_seek_speed] * sign);
+                            broadcast_tx.send((*state).into()).unwrap();
+                        }
+                    }
+                    KeyCode::Char(' ') | KeyCode::Char('k') => {
                         // Toggle pause/play
                         let mut current_video_guard = current_video.write().await;
                         if let Some((_loaded_video, state)) = &mut *current_video_guard {
+                            state.normalize_time(&start_time);
                             *state = match *state {
                                 State::StartPlayingAt {
                                     playback_time_frames,
-                                    unix_time_micro,
+                                    ..
                                 } => {
-                                    let time_played_since_pause =
-                                        start_time.elapsed().saturating_sub(Duration::from_micros(
-                                            unix_time_micro.try_into()?,
-                                        )) + PLAYBACK_START_BUF;
-                                    let time_played_since_pause_frames =
-                                        (time_played_since_pause.as_secs_f64() * fps) as u64;
+                                    // This playback_time_frames is up-to-date because normalize_time does the math to caluclate the current playback_time_frames
                                     State::PauseAt {
-                                        playback_time_frames: playback_time_frames
-                                            + time_played_since_pause_frames,
+                                        playback_time_frames,
                                     }
                                 }
                                 State::PauseAt {
@@ -368,7 +415,7 @@ async fn main() -> Result<()> {
                                     ..
                                 } => info!(
                                     "Current time is {:?}",
-                                    Duration::from_secs_f64(playback_time_frames as f64 / fps)
+                                    Duration::from_secs_f64(playback_time_frames as f64 / FPS)
                                 ),
                             }
                         } else {
@@ -419,6 +466,10 @@ async fn main() -> Result<()> {
         // Some log messages might have been sent while handling events. Process them before repainting.
         log_buffer.try_recv_entries(&mut log_receiver);
 
+        let seek = format!(
+            "(seek {:.3}s)",
+            seek_speeds[current_seek_speed] as f64 / FPS
+        );
         let title = {
             let current_video_guard = current_video.read().await;
             if let Some((video, state)) = &*current_video_guard {

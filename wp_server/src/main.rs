@@ -26,22 +26,53 @@ struct VideoDescription {
     download: Download,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    StartPlayingAt {
+        unix_time_micro: u128,
+        playback_time_frames: u64,
+    },
+    PauseAt {
+        playback_time_frames: u64,
+    },
+}
+
+impl From<State> for ServerMsg {
+    fn from(value: State) -> Self {
+        match value {
+            State::PauseAt {
+                playback_time_frames,
+            } => ServerMsg::PauseAt {
+                playback_time_frames,
+            },
+            State::StartPlayingAt {
+                unix_time_micro,
+                playback_time_frames,
+            } => ServerMsg::StartPlayingAt {
+                unix_time_micro,
+                playback_time_frames,
+            },
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:3945").await?;
     let start_time = Arc::new(Instant::now());
 
     let (broadcast_tx, broadcast_rx) = broadcast::channel(10);
-    let current_video = Arc::new(RwLock::new(None));
+    let current_video = Arc::new(RwLock::new(Option::<(ServerMsg, State)>::None));
 
     let current_video_clients = current_video.clone();
+    let start_time_clients = start_time.clone();
     tokio::spawn(async move {
         loop {
             let (mut socket, addr) = listener.accept().await.unwrap();
 
             let mut retransmit_channel = broadcast_rx.resubscribe();
 
-            let start_time = start_time.clone();
+            let start_time = start_time_clients.clone();
             let current_video = current_video_clients.clone();
             tokio::spawn(async move {
                 let mut magic_buf = [0; 4];
@@ -119,8 +150,29 @@ async fn main() -> Result<()> {
                 let mean_time_delta = Duration::from_secs_f64(mean_time_delta);
 
                 {
-                    if let Some(loaded_video) = &*current_video.read().await {
+                    if let Some((loaded_video, state)) = &*current_video.read().await {
                         send_socket(&mut socket, loaded_video).await.unwrap();
+                        send_socket(
+                            &mut socket,
+                            match Into::<ServerMsg>::into(*state) {
+                                ServerMsg::StartPlayingAt {
+                                    unix_time_micro,
+                                    playback_time_frames,
+                                } => {
+                                    let client_time_micro = (Duration::from_micros(
+                                        unix_time_micro.try_into().unwrap(),
+                                    ) - mean_time_delta)
+                                        .as_micros();
+                                    ServerMsg::StartPlayingAt {
+                                        unix_time_micro: client_time_micro,
+                                        playback_time_frames,
+                                    }
+                                }
+                                other => other,
+                            },
+                        )
+                        .await
+                        .unwrap();
                     }
                 }
 
@@ -129,7 +181,7 @@ async fn main() -> Result<()> {
                     let msg = match command {
                         ServerMsg::StartPlayingAt {
                             unix_time_micro,
-                            play_back_time,
+                            playback_time_frames,
                         } => {
                             let client_time_micro =
                                 (Duration::from_micros(unix_time_micro.try_into().unwrap())
@@ -137,7 +189,7 @@ async fn main() -> Result<()> {
                                     .as_micros();
                             ServerMsg::StartPlayingAt {
                                 unix_time_micro: client_time_micro,
-                                play_back_time,
+                                playback_time_frames,
                             }
                         }
                         msg => msg,
@@ -162,6 +214,10 @@ async fn main() -> Result<()> {
         let msg = msg.trim();
         println!("Msg '{}'", msg);
 
+        // TODO: Make milliseconds delay configurable? Or dynamically adapt based on client latencies?
+        const PLAYBACK_START_BUF: Duration = Duration::from_millis(500);
+        let fps = 60.0;
+
         match msg {
             "exit" => {
                 break;
@@ -169,7 +225,50 @@ async fn main() -> Result<()> {
             "t" => {
                 broadcast_tx.send(ServerMsg::Error(format!("wow")))?;
             }
-            _ => (),
+            "" => {
+                let mut current_video_guard = current_video.write().await;
+                let Some((_loaded_video, state)) = &mut *current_video_guard else {
+                    println!("No video loaded.");
+                    continue;
+                };
+                *state = match *state {
+                    State::StartPlayingAt {
+                        playback_time_frames,
+                        unix_time_micro,
+                    } => {
+                        let time_played_since_pause = start_time
+                            .elapsed()
+                            .saturating_sub(Duration::from_micros(unix_time_micro.try_into()?)) + PLAYBACK_START_BUF;
+                        let time_played_since_pause_frames =
+                            (time_played_since_pause.as_secs_f64() * fps) as u64;
+                        State::PauseAt {
+                            playback_time_frames: playback_time_frames
+                                + time_played_since_pause_frames,
+                        }
+                    }
+                    State::PauseAt {
+                        playback_time_frames,
+                    } => State::StartPlayingAt {
+                        unix_time_micro: (start_time.elapsed() + PLAYBACK_START_BUF).as_micros(),
+                        playback_time_frames,
+                    },
+                };
+                broadcast_tx.send((*state).into())?;
+                println!("State is now {:?}", state);
+                match *state {
+                    State::PauseAt {
+                        playback_time_frames,
+                    }
+                    | State::StartPlayingAt {
+                        playback_time_frames,
+                        ..
+                    } => println!(
+                        "Current time is {:?}",
+                        Duration::from_secs_f64(playback_time_frames as f64 / fps)
+                    ),
+                }
+            }
+            unknown_command => println!("'{}' is not a command", unknown_command),
         }
     }
 

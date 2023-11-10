@@ -1,11 +1,12 @@
 use std::fs::{create_dir, File};
 use std::io::{stdout, Read, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::Instant;
-use std::{env, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use futures_util::StreamExt;
+use gstreamer::ClockTime;
 use gstreamer_play::{Play, PlayVideoRenderer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -40,7 +41,6 @@ async fn main() -> Result<()> {
     loop {
         let size = socket.read_u32_le().await?.try_into()?;
         buf.clear();
-        // buf.reserve(size);
         buf.resize(size, 0);
         let mut buf_slice = &mut buf[..size];
         socket.read_exact(&mut buf_slice).await?;
@@ -94,7 +94,10 @@ async fn main() -> Result<()> {
                         assert!(e.starts_with(START), "{e:?}");
                         let e = e.replacen(START, "file:///", 1);
                         play.set_uri(Some(&e));
+                        println!("File already exists");
                         play.play();
+                        play.pause();
+                        play.seek(ClockTime::from_mseconds(0));
                         continue;
                     }
                     println!("Wrong video file download");
@@ -147,14 +150,47 @@ async fn main() -> Result<()> {
                             assert!(e.starts_with(START), "{e:?}");
                             let e = e.replacen(START, "file:///", 1);
                             play.set_uri(Some(&e));
+                            println!("File downloaded");
                             play.play();
+                            play.pause();
+                            play.seek(ClockTime::from_mseconds(0));
                             continue;
                         }
                     }
                     wp_transaction::Download::None => todo!(),
                 }
             }
-            _ => todo!(),
+            ServerMsg::PauseAt {
+                playback_time_frames,
+            } => {
+                play.pause();
+                play.seek(ClockTime::from_seconds_f64(
+                    playback_time_frames as f64 / 60.0,
+                ))
+            }
+            ServerMsg::StartPlayingAt {
+                unix_time_micro,
+                playback_time_frames,
+            } => {
+                play.pause();
+                let current_time = start_time.elapsed();
+                let target_time = Duration::from_micros(unix_time_micro.try_into()?);
+                if let Some(delay) = target_time.checked_sub(current_time) {
+                    // Don't know how long that seeking will take so `sleep_until` instead of just delaying
+                    let target_instant = start_time + delay;
+                    play.seek(ClockTime::from_seconds_f64(
+                        playback_time_frames as f64 / 60.0,
+                    ));
+                    tokio::time::sleep_until(target_instant.into()).await;
+                    play.play();
+                } else {
+                    play.seek(ClockTime::from_seconds_f64(
+                        (current_time - target_time).as_secs_f64()
+                            + (playback_time_frames as f64 / 60.0),
+                    ));
+                    play.play();
+                }
+            }
         }
     }
 }

@@ -28,10 +28,10 @@ pub enum ServerMsg {
     },
     StartPlayingAt {
         unix_time_micro: u128,
-        play_back_time: u64,
+        playback_time_frames: u64,
     },
     PauseAt {
-        play_back_time: u64,
+        playback_time_frames: u64,
     },
 }
 

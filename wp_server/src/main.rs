@@ -1,11 +1,27 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossterm::{
+    event::{self, EventStream, KeyCode, KeyEventKind},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
+};
+use futures_util::StreamExt;
+use log::{debug, info};
+use ratatui::prelude::{Constraint, Layout};
+use ratatui::style::Style;
+use ratatui::widgets::{Block, Borders, Widget};
+use ratatui::{
+    prelude::{CrosstermBackend, Terminal},
+    widgets::Paragraph,
+};
 use serde::{Deserialize, Serialize};
-use tokio::io::{stdin, AsyncReadExt, AsyncWriteExt};
+use std::io::stdout;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{broadcast, RwLock};
 use wp_transaction::{ClientMsg, ContentHash, Download, ServerMsg, MAGIC, VERSION};
 
@@ -56,8 +72,89 @@ impl From<State> for ServerMsg {
     }
 }
 
+static LOGGER: LogQueue = LogQueue(OnceLock::new());
+
+struct LogQueue(OnceLock<UnboundedSender<String>>);
+
+impl log::Log for LogQueue {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        self.0.get().is_some()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if let Some(log_queue) = self.0.get() {
+            log_queue.send(format!("{}", record.args())).unwrap();
+        }
+    }
+
+    fn flush(&self) {
+        // Doesn't need to be flushed
+    }
+}
+
+struct LogBuffer {
+    queue: VecDeque<String>,
+    max_len: usize,
+}
+
+impl LogBuffer {
+    fn new() -> Self {
+        Self {
+            queue: Default::default(),
+            max_len: 100,
+        }
+    }
+
+    fn append_entry(&mut self, msg: String) {
+        for msg_part in msg.split('\n') {
+            for _ in 0..(self.queue.len() + 1).saturating_sub(self.max_len) {
+                self.queue.pop_front();
+            }
+            self.queue.push_back(msg_part.to_string());
+        }
+    }
+
+    async fn recv_entries(&mut self, receiver: &mut UnboundedReceiver<String>) {
+        self.append_entry(receiver.recv().await.unwrap());
+
+        // Process more message opportunistically for better perf
+        self.try_recv_entries(receiver);
+    }
+
+    fn try_recv_entries(&mut self, receiver: &mut UnboundedReceiver<String>) {
+        while let Ok(msg) = receiver.try_recv() {
+            self.append_entry(msg);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.queue.iter().rev().map(AsRef::as_ref)
+    }
+}
+
+struct LogBufferWidget<'a>(&'a LogBuffer);
+
+impl<'a> Widget for LogBufferWidget<'a> {
+    fn render(self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer) {
+        for (i, text) in (0..area.height).rev().zip(self.0.iter()) {
+            // TODO: Fix style
+            buf.set_stringn(
+                area.x,
+                area.y + i,
+                text,
+                area.width.into(),
+                Style::default(),
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let (log_sender, mut log_receiver) = mpsc::unbounded_channel();
+    LOGGER.0.set(log_sender).unwrap();
+    log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Debug))?;
+
     let listener = TcpListener::bind("0.0.0.0:3945").await?;
     let start_time = Arc::new(Instant::now());
 
@@ -98,9 +195,9 @@ async fn main() -> Result<()> {
                     panic!("Wrong version {version} (supported version {VERSION})");
                 }
 
-                println!("{}: Client connected", addr);
+                info!("{}: Client connected", addr);
 
-                println!("{}: Syncing time...", addr);
+                info!("{}: Syncing time...", addr);
                 let mut time_id_counter = 0;
                 let mut samples = vec![];
                 for _ in 0..100 {
@@ -135,7 +232,7 @@ async fn main() -> Result<()> {
                 }
 
                 let samples = samples.into_iter().collect::<BTreeMap<_, _>>();
-                dbg!(&samples);
+                debug!("{:#?}", &samples);
                 let mut samples_iter = samples.into_iter().rev();
                 let (mut _last_error, mean) = samples_iter.next().unwrap();
                 let mut mean_time_delta = mean.as_secs_f64();
@@ -145,7 +242,7 @@ async fn main() -> Result<()> {
                     mean_time_delta = mean_time_delta * (sample_importance_ration)
                         + sample.as_secs_f64() * (1.0 - sample_importance_ration);
                 }
-                println!("{}: Time delta is {}s", addr, mean_time_delta);
+                info!("{}: Time delta is {}s", addr, mean_time_delta);
 
                 let mean_time_delta = Duration::from_secs_f64(mean_time_delta);
 
@@ -200,77 +297,118 @@ async fn main() -> Result<()> {
         }
     });
 
+    // TODO: Make milliseconds delay configurable? Or dynamically adapt based on client latencies?
+    const PLAYBACK_START_BUF: Duration = Duration::from_millis(500);
+    let fps = 60.0;
+
+    stdout().execute(EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    terminal.clear()?;
+    info!("Intialized.");
+
+    let mut log_buffer = LogBuffer::new();
+    let mut event_stream = EventStream::new();
     loop {
-        let mut msg = Vec::new();
-        loop {
-            let byte = stdin().read_u8().await.unwrap();
-            if byte == b'\n' {
-                break;
+        let event = tokio::select! {
+            event = event_stream.next() => {
+                Some(event.unwrap()?)
+            },
+            _ = log_buffer.recv_entries(&mut log_receiver) => {
+                None
             }
-            msg.push(byte);
-        }
+        };
 
-        let msg = String::from_utf8_lossy(&msg);
-        let msg = msg.trim();
-        println!("Msg '{}'", msg);
-
-        // TODO: Make milliseconds delay configurable? Or dynamically adapt based on client latencies?
-        const PLAYBACK_START_BUF: Duration = Duration::from_millis(500);
-        let fps = 60.0;
-
-        match msg {
-            "exit" => {
-                break;
-            }
-            "t" => {
-                broadcast_tx.send(ServerMsg::Error(format!("wow")))?;
-            }
-            "" => {
-                let mut current_video_guard = current_video.write().await;
-                let Some((_loaded_video, state)) = &mut *current_video_guard else {
-                    println!("No video loaded.");
-                    continue;
-                };
-                *state = match *state {
-                    State::StartPlayingAt {
-                        playback_time_frames,
-                        unix_time_micro,
-                    } => {
-                        let time_played_since_pause = start_time
-                            .elapsed()
-                            .saturating_sub(Duration::from_micros(unix_time_micro.try_into()?)) + PLAYBACK_START_BUF;
-                        let time_played_since_pause_frames =
-                            (time_played_since_pause.as_secs_f64() * fps) as u64;
-                        State::PauseAt {
-                            playback_time_frames: playback_time_frames
-                                + time_played_since_pause_frames,
-                        }
+        if let Some(event::Event::Key(key)) = event {
+            if key.kind == KeyEventKind::Press {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        // Exit
+                        break;
                     }
-                    State::PauseAt {
-                        playback_time_frames,
-                    } => State::StartPlayingAt {
-                        unix_time_micro: (start_time.elapsed() + PLAYBACK_START_BUF).as_micros(),
-                        playback_time_frames,
-                    },
-                };
-                broadcast_tx.send((*state).into())?;
-                println!("State is now {:?}", state);
-                match *state {
-                    State::PauseAt {
-                        playback_time_frames,
+                    KeyCode::Char(' ') => {
+                        // Toggle pause/play
+                        let mut current_video_guard = current_video.write().await;
+                        if let Some((_loaded_video, state)) = &mut *current_video_guard {
+                            *state = match *state {
+                                State::StartPlayingAt {
+                                    playback_time_frames,
+                                    unix_time_micro,
+                                } => {
+                                    let time_played_since_pause =
+                                        start_time.elapsed().saturating_sub(Duration::from_micros(
+                                            unix_time_micro.try_into()?,
+                                        )) + PLAYBACK_START_BUF;
+                                    let time_played_since_pause_frames =
+                                        (time_played_since_pause.as_secs_f64() * fps) as u64;
+                                    State::PauseAt {
+                                        playback_time_frames: playback_time_frames
+                                            + time_played_since_pause_frames,
+                                    }
+                                }
+                                State::PauseAt {
+                                    playback_time_frames,
+                                } => State::StartPlayingAt {
+                                    unix_time_micro: (start_time.elapsed() + PLAYBACK_START_BUF)
+                                        .as_micros(),
+                                    playback_time_frames,
+                                },
+                            };
+                            broadcast_tx.send((*state).into())?;
+                            info!("State is now {:?}", state);
+                            match *state {
+                                State::PauseAt {
+                                    playback_time_frames,
+                                }
+                                | State::StartPlayingAt {
+                                    playback_time_frames,
+                                    ..
+                                } => info!(
+                                    "Current time is {:?}",
+                                    Duration::from_secs_f64(playback_time_frames as f64 / fps)
+                                ),
+                            }
+                        } else {
+                            info!("No video loaded.");
+                        };
                     }
-                    | State::StartPlayingAt {
-                        playback_time_frames,
-                        ..
-                    } => println!(
-                        "Current time is {:?}",
-                        Duration::from_secs_f64(playback_time_frames as f64 / fps)
-                    ),
+                    KeyCode::Char('t') => {
+                        broadcast_tx.send(ServerMsg::Error(format!("wow")))?;
+                    }
+                    _ => (),
                 }
             }
-            unknown_command => println!("'{}' is not a command", unknown_command),
         }
+
+        // Some log messages might have been sent while handling events. Process them before repainting.
+        log_buffer.try_recv_entries(&mut log_receiver);
+
+        terminal.draw(|frame| {
+            let main_layout = Layout::default()
+                .direction(ratatui::prelude::Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .split(frame.size());
+
+            // Show playing state here
+            frame.render_widget(Paragraph::new("Player"), main_layout[0]);
+
+            let border = Block::default().title("log").borders(Borders::ALL);
+            frame.render_widget(LogBufferWidget(&log_buffer), border.inner(main_layout[1]));
+            frame.render_widget(border, main_layout[1]);
+
+            frame.render_widget(
+                Paragraph::new("q/esc (quit) | 1-9 (video selection) | space (toggle playback)"),
+                main_layout[2],
+            );
+        })?;
     }
+
+    stdout().execute(LeaveAlternateScreen)?;
+    disable_raw_mode()?;
 
     Ok(())
 }

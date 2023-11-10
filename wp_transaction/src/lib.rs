@@ -51,3 +51,20 @@ pub enum Download {
 pub enum ContentHash {
     Sha256(String),
 }
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ServingVideo {
+    pub hash: ContentHash,
+    pub name: String,
+    pub download: Download,
+}
+
+impl From<ServingVideo> for ServerMsg {
+    fn from(value: ServingVideo) -> Self {
+        Self::LoadVideo {
+            hash: value.hash,
+            name: value.name,
+            download: value.download,
+        }
+    }
+}

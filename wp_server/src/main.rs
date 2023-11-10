@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::File;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use futures_util::StreamExt;
-use log::{debug, info};
+use log::{debug, error, info};
 use ratatui::prelude::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Widget};
@@ -23,7 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{broadcast, RwLock};
-use wp_transaction::{ClientMsg, ContentHash, Download, ServerMsg, MAGIC, VERSION};
+use wp_transaction::{ClientMsg, ContentHash, Download, ServerMsg, ServingVideo, MAGIC, VERSION};
 
 async fn send_socket(socket: &mut TcpStream, payload: impl AsRef<ServerMsg>) -> Result<()> {
     let buf: Vec<u8> = postcard::to_allocvec(payload.as_ref())?;
@@ -159,7 +160,7 @@ async fn main() -> Result<()> {
     let start_time = Arc::new(Instant::now());
 
     let (broadcast_tx, broadcast_rx) = broadcast::channel(10);
-    let current_video = Arc::new(RwLock::new(Option::<(ServerMsg, State)>::None));
+    let current_video = Arc::new(RwLock::new(Option::<(ServingVideo, State)>::None));
 
     let current_video_clients = current_video.clone();
     let start_time_clients = start_time.clone();
@@ -248,7 +249,9 @@ async fn main() -> Result<()> {
 
                 {
                     if let Some((loaded_video, state)) = &*current_video.read().await {
-                        send_socket(&mut socket, loaded_video).await.unwrap();
+                        send_socket(&mut socket, Into::<ServerMsg>::into(loaded_video.clone()))
+                            .await
+                            .unwrap();
                         send_socket(
                             &mut socket,
                             match Into::<ServerMsg>::into(*state) {
@@ -372,16 +375,61 @@ async fn main() -> Result<()> {
                             info!("No video loaded.");
                         };
                     }
+                    KeyCode::Char(num @ '1'..='9') => {
+                        let res = async {
+                            let mut file = File::open("videos.json").map_err(|err| {
+                                anyhow::anyhow!("Failed to load `videos.json`: {}", err)
+                            })?;
+                            let videos: HashMap<u8, ServingVideo> =
+                                serde_json::from_reader(&mut file)?;
+                            let num = num.to_digit(10).unwrap().try_into().unwrap();
+                            if let Some(msg) = videos.get(&num) {
+                                {
+                                    let mut current_video_guard = current_video.write().await;
+                                    *current_video_guard = Some((
+                                        msg.clone(),
+                                        State::PauseAt {
+                                            playback_time_frames: 0,
+                                        },
+                                    ));
+                                }
+                                broadcast_tx.send(msg.clone().into())?;
+                                info!("Video loaded: '{}'", msg.name);
+                                Ok(())
+                            } else {
+                                Err(anyhow::anyhow!("Not video entry '{}'", num))
+                            }
+                        };
+
+                        match res.await {
+                            Ok(_) => {}
+                            Err(err) => error!("{}", err),
+                        }
+                    }
                     KeyCode::Char('t') => {
                         broadcast_tx.send(ServerMsg::Error(format!("wow")))?;
                     }
-                    _ => (),
+                    _ => continue, // Don't repaint since event was ignored
                 }
+            } else {
+                continue; // Don't repaint since event was ignored
             }
         }
 
         // Some log messages might have been sent while handling events. Process them before repainting.
         log_buffer.try_recv_entries(&mut log_receiver);
+
+        let title = {
+            let current_video_guard = current_video.read().await;
+            if let Some((video, state)) = &*current_video_guard {
+                match state {
+                    State::StartPlayingAt { .. } => format!("Playing: {seek} '{}'", video.name),
+                    State::PauseAt { .. } => format!("Paused:  {seek} '{}'", video.name),
+                }
+            } else {
+                format!("Player: No video loaded")
+            }
+        };
 
         terminal.draw(|frame| {
             let main_layout = Layout::default()
@@ -394,7 +442,7 @@ async fn main() -> Result<()> {
                 .split(frame.size());
 
             // Show playing state here
-            frame.render_widget(Paragraph::new("Player"), main_layout[0]);
+            frame.render_widget(Paragraph::new(title), main_layout[0]);
 
             let border = Block::default().title("log").borders(Borders::ALL);
             frame.render_widget(LogBufferWidget(&log_buffer), border.inner(main_layout[1]));

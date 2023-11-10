@@ -238,7 +238,7 @@ async fn main() -> Result<()> {
                 info!("{}: Syncing time...", addr);
                 let mut time_id_counter = 0;
                 let mut samples = vec![];
-                for _ in 0..100 {
+                for _ in 0..30 {
                     send_socket(
                         &mut socket,
                         ServerMsg::RequestTime {
@@ -271,16 +271,26 @@ async fn main() -> Result<()> {
 
                 let samples = samples.into_iter().collect::<BTreeMap<_, _>>();
                 debug!("{:#?}", &samples);
+                let sample_count = samples.len();
                 let mut samples_iter = samples.into_iter().rev();
                 let (mut _last_error, mean) = samples_iter.next().unwrap();
                 let mut mean_time_delta = mean.as_secs_f64();
-                for (_error, sample) in samples_iter {
+                let mut error_sum = Duration::ZERO;
+                for (error, sample) in samples_iter {
+                    error_sum += error;
                     // TODO: Measure this based on error somehow to be more statistically rigorous?
                     let sample_importance_ration = 0.25;
                     mean_time_delta = mean_time_delta * (sample_importance_ration)
                         + sample.as_secs_f64() * (1.0 - sample_importance_ration);
                 }
-                info!("{}: Time delta is {}s", addr, mean_time_delta);
+                let greeting = format!(
+                    "Time delta ({:?}), mean latency ({:?}), samples ({})",
+                    Duration::from_secs_f64(mean_time_delta),
+                    error_sum / (sample_count as u32),
+                    sample_count
+                );
+                info!("{}: {}", addr, greeting);
+                send_socket(&mut socket, ServerMsg::Error(greeting)).await.unwrap();
 
                 let mean_time_delta = Duration::from_secs_f64(mean_time_delta);
 
@@ -372,8 +382,15 @@ async fn main() -> Result<()> {
                     KeyCode::Char('o') | KeyCode::Up => {
                         current_seek_speed = current_seek_speed.saturating_sub(1);
                     }
-                    key @ (KeyCode::Char('j') | KeyCode::Char('l') | KeyCode::Right | KeyCode::Left) => {
-                        let sign = if key == KeyCode::Char('l') || key == KeyCode::Right { 1 } else { -1 };
+                    key @ (KeyCode::Char('j')
+                    | KeyCode::Char('l')
+                    | KeyCode::Right
+                    | KeyCode::Left) => {
+                        let sign = if key == KeyCode::Char('l') || key == KeyCode::Right {
+                            1
+                        } else {
+                            -1
+                        };
                         let mut current_video_guard = current_video.write().await;
                         if let Some((_loaded_video, state)) = &mut *current_video_guard {
                             state.normalize_time(&start_time);

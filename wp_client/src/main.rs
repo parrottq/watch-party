@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
         socket.read_exact(&mut buf_slice).await?;
         let msg: ServerMsg = postcard::from_bytes(&buf_slice)?;
         match msg {
-            ServerMsg::Error(error) => println!("Got error: {}", error),
+            ServerMsg::Error(error) => println!("Server: {}", error),
             ServerMsg::RequestTime { id } => {
                 send_socket(
                     &mut socket,

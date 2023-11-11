@@ -1,0 +1,11 @@
+{
+    "1": {
+        "hash": {
+            "Sha256": "1cdf1cb514150774618bdbfcbe9c8b351e2d243407a1c772a36e45134cf51246"
+        },
+        "name": "sintel_trailer-480p.webm",
+        "download": {
+            "Https": "https://gstreamer.freedesktop.org/data/media/sintel_trailer-480p.webm"
+        }
+    }
+}

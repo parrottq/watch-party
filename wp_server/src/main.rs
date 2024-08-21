@@ -520,7 +520,7 @@ async fn main() -> Result<()> {
                     Constraint::Min(0),
                     Constraint::Length(1),
                 ])
-                .split(frame.size());
+                .split(frame.area());
 
             // Show playing state here
             frame.render_widget(Paragraph::new(title), main_layout[0]);
